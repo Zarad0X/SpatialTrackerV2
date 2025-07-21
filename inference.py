@@ -101,6 +101,165 @@ def generate_coords_4d(track2d_pred, depth_tensor, vis_pred, intrs, mask_list):
     
     return coords_4d
 
+def generate_tracking_data(images_dict, track_mode="offline", vo_points=756, grid_size=10, 
+                          use_per_frame_mask=True, camera_coords=True, no_resize=True):
+    """
+    从图像数据生成coords_4d和point_indices
+    
+    Args:
+        images_dict: 包含rgbs, depths, masks, camera_matrix的字典
+        track_mode: 追踪模式 ("offline" or "online")
+        vo_points: VO点数量
+        grid_size: 网格大小
+        use_per_frame_mask: 是否使用每帧对应的mask
+        camera_coords: 是否输出相机坐标系下的轨迹
+        no_resize: 是否禁用图像缩放
+    
+    Returns:
+        tuple: (coords_4d, point_indices) 或 (None, None) 如果失败
+            - coords_4d: numpy array of shape (1, T, 5, H, W)
+            - point_indices: tuple of (y_indices, x_indices)
+    """
+    try:
+        # 从images_dict获取数据
+        rgbs = images_dict["rgbs"]
+        depths = images_dict["depths"] 
+        masks = images_dict["masks"]
+        camera_matrix = images_dict["camera_matrix"]
+        
+        # 转换为tensor格式
+        video_list = []
+        for rgb in rgbs:
+            if isinstance(rgb, np.ndarray):
+                video_list.append(rgb)
+            else:
+                video_list.append(rgb)
+        
+        video_tensor = np.array(video_list).transpose(0, 3, 1, 2).astype(np.float32)
+        video_tensor = torch.from_numpy(video_tensor)
+        
+        # 深度数据处理
+        if isinstance(depths[0], np.ndarray):
+            depth_tensor = np.array(depths)
+        else:
+            depth_tensor = depths
+            
+        # 内参处理
+        num_frames = len(rgbs)
+        if camera_matrix.shape == (3, 3):
+            intrs = np.tile(camera_matrix[None, :, :], (num_frames, 1, 1))
+        else:
+            intrs = camera_matrix
+            
+        # 外参（初始化为单位矩阵）
+        extrs = np.tile(np.eye(4)[None, :, :], (num_frames, 1, 1))
+        
+        # 加载模型
+        vggt4track_model = VGGT4Track.from_pretrained("Yuxihenry/SpatialTrackerV2_Front")
+        vggt4track_model.eval()
+        vggt4track_model = vggt4track_model.to("cuda")
+        
+        if track_mode == "offline":
+            model = Predictor.from_pretrained("Yuxihenry/SpatialTrackerV2-Offline")
+        else:
+            model = Predictor.from_pretrained("Yuxihenry/SpatialTrackerV2-Online")
+        
+        model.spatrack.track_num = vo_points
+        model.eval()
+        model.to("cuda")
+        
+        # 获取图像尺寸
+        frame_H, frame_W = video_tensor.shape[2:]
+        grid_pts = get_points_on_a_grid(grid_size, (frame_H, frame_W), device="cpu")
+        
+        # 处理mask
+        if isinstance(masks, list):
+            # 使用第一帧的mask进行网格点过滤
+            first_mask = masks[0]
+            if isinstance(first_mask, np.ndarray) and first_mask.size > 0:
+                grid_pts_int = grid_pts[0].long()
+                mask_values = first_mask[grid_pts_int[...,1], grid_pts_int[...,0]]
+                grid_pts = grid_pts[:, mask_values]
+            mask_list = masks
+        # else:
+        #     # 单个mask
+        #     if isinstance(masks, np.ndarray) and masks.size > 0:
+        #         grid_pts_int = grid_pts[0].long()
+        #         mask_values = masks[grid_pts_int[...,1], grid_pts_int[...,0]]
+        #         grid_pts = grid_pts[:, mask_values]
+        #     # 为每帧创建相同的mask
+        #     mask_list = [masks] * num_frames
+        
+        query_xyt = torch.cat([torch.zeros_like(grid_pts[:, :, :1]), grid_pts], dim=2)[0].numpy()
+        
+        # 运行模型推理
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            (
+                c2w_traj, intrs_pred, point_map, conf_depth,
+                track3d_pred, track2d_pred, vis_pred, conf_pred, video
+            ) = model.forward(video_tensor, depth=depth_tensor,
+                                intrs=intrs, extrs=extrs, 
+                                queries=query_xyt,
+                                fps=1, full_point=False, iters_track=4,
+                                query_no_BA=True, fixed_cam=False, stage=1, unc_metric=None,
+                                support_frame=len(video_tensor)-1, replace_ratio=0.2)
+            
+            # 根据参数决定是否缩放
+            max_size = 336
+            h, w = video.shape[2:]
+            scale = min(max_size / h, max_size / w)
+            
+            # if scale < 1 and not no_resize:
+            #     new_h, new_w = int(h * scale), int(w * scale)
+            #     video = T.Resize((new_h, new_w))(video)
+            #     video_tensor = T.Resize((new_h, new_w))(video_tensor)
+            #     point_map = T.Resize((new_h, new_w))(point_map)
+            #     conf_depth = T.Resize((new_h, new_w))(conf_depth)
+            #     track2d_pred[...,:2] = track2d_pred[...,:2] * scale
+            #     intrs_pred[:,:2,:] = intrs_pred[:,:2,:] * scale
+                
+            #     # 缩放mask
+            #     mask_list_resized = []
+            #     for mask in mask_list:
+            #         if isinstance(mask, np.ndarray):
+            #             mask_resized = cv2.resize(mask.astype(np.uint8), (new_w, new_h)).astype(bool)
+            #             mask_list_resized.append(mask_resized)
+            #         else:
+            #             mask_list_resized.append(mask)
+            #     mask_list = mask_list_resized
+                
+            #     if depth_tensor is not None:
+            #         if isinstance(depth_tensor, torch.Tensor):
+            #             depth_tensor = T.Resize((new_h, new_w))(depth_tensor)
+            #         else:
+            #             depth_tensor = T.Resize((new_h, new_w))(torch.from_numpy(depth_tensor))
+            
+            # 生成coords_4d
+            coords_4d = generate_coords_4d(
+                track2d_pred.cpu().numpy() if isinstance(track2d_pred, torch.Tensor) else track2d_pred,
+                depth_tensor,
+                vis_pred.cpu().numpy() if isinstance(vis_pred, torch.Tensor) else vis_pred,
+                intrs_pred.cpu().numpy() if isinstance(intrs_pred, torch.Tensor) else intrs_pred,
+                mask_list
+            )
+            
+            # # 生成point_indices
+            # point_indices = grid_pts[0].long().cpu().numpy()  # shape (N, 2)
+            # x_indices = point_indices[:, 0]
+            # y_indices = point_indices[:, 1]
+            # point_indices_tuple = (y_indices, x_indices)
+            
+            print(f"Generated coords_4d with shape: {coords_4d.shape}")
+         
+            
+            return coords_4d
+            
+    except Exception as e:
+        print(f"Error in generate_tracking_data: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--track_mode", type=str, default="offline")
@@ -412,23 +571,25 @@ if __name__ == "__main__":
         
         # resize the results to avoid too large I/O Burden
         # depth and image, the maximum side is 336
-        max_size = 336
-        h, w = video.shape[2:]
-        scale = min(max_size / h, max_size / w)
-        if scale < 1 and not args.no_resize:
-            new_h, new_w = int(h * scale), int(w * scale)
-            video = T.Resize((new_h, new_w))(video)
-            video_tensor = T.Resize((new_h, new_w))(video_tensor)
-            point_map = T.Resize((new_h, new_w))(point_map)
-            conf_depth = T.Resize((new_h, new_w))(conf_depth)
-            track2d_pred[...,:2] = track2d_pred[...,:2] * scale
-            intrs[:,:2,:] = intrs[:,:2,:] * scale
-            if depth_tensor is not None:
-                if isinstance(depth_tensor, torch.Tensor):
-                    depth_tensor = T.Resize((new_h, new_w))(depth_tensor)
-                else:
-                    depth_tensor = T.Resize((new_h, new_w))(torch.from_numpy(depth_tensor))
-
+        # max_size = 336
+        # h, w = video.shape[2:]
+        # scale = min(max_size / h, max_size / w)
+        # # 根据参数决定是否缩放
+        # if scale < 1 and not args.no_resize:
+        #     new_h, new_w = int(h * scale), int(w * scale)
+        #     video = T.Resize((new_h, new_w))(video)
+        #     video_tensor = T.Resize((new_h, new_w))(video_tensor)
+        #     point_map = T.Resize((new_h, new_w))(point_map)
+        #     conf_depth = T.Resize((new_h, new_w))(conf_depth)
+        #     track2d_pred[...,:2] = track2d_pred[...,:2] * scale
+        #     intrs[:,:2,:] = intrs[:,:2,:] * scale
+        #     # 同时缩放mask
+        #     mask = cv2.resize(mask.astype(np.uint8), (new_w, new_h)).astype(bool)
+        #     if depth_tensor is not None:
+        #         if isinstance(depth_tensor, torch.Tensor):
+        #             depth_tensor = T.Resize((new_h, new_w))(depth_tensor)
+        #         else:
+        #             depth_tensor = T.Resize((new_h, new_w))(torch.from_numpy(depth_tensor))
         
 
         if viz:
@@ -443,19 +604,18 @@ if __name__ == "__main__":
             # 输出世界坐标系下的3D轨迹（原来的方式）
             data_npz_load["coords"] = (torch.einsum("tij,tnj->tni", c2w_traj[:,:3,:3], track3d_pred[:,:,:3].cpu()) + c2w_traj[:,:3,3][:,None,:]).numpy()
         
-        # 如果请求输出coords_4d格式
-        if args.output_coords_4d:
-            coords_4d = generate_coords_4d(
-                track2d_pred.cpu().numpy() if isinstance(track2d_pred, torch.Tensor) else track2d_pred,
-                depth_tensor,
-                vis_pred.cpu().numpy() if isinstance(vis_pred, torch.Tensor) else vis_pred,
-                intrs.cpu().numpy() if isinstance(intrs, torch.Tensor) else intrs,
-                mask
-            )
-            import ipdb
-            ipdb.set_trace()
-            data_npz_load["coords_4d"] = coords_4d
-            print(f"Generated coords_4d with shape: {coords_4d.shape}")
+        # 输出coords_4d格式
+        
+        coords_4d = generate_coords_4d(
+            track2d_pred.cpu().numpy() if isinstance(track2d_pred, torch.Tensor) else track2d_pred,
+            depth_tensor,
+            vis_pred.cpu().numpy() if isinstance(vis_pred, torch.Tensor) else vis_pred,
+            intrs.cpu().numpy() if isinstance(intrs, torch.Tensor) else intrs,
+            mask
+        )
+            
+        data_npz_load["coords_4d"] = coords_4d
+        print(f"Generated coords_4d with shape: {coords_4d.shape}")
 
         # save as the tapip3d format   
         data_npz_load["coords"] = (torch.einsum("tij,tnj->tni", c2w_traj[:,:3,:3], track3d_pred[:,:,:3].cpu()) + c2w_traj[:,:3,3][:,None,:]).numpy()
